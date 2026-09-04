@@ -373,6 +373,35 @@ class ChromiumPopulator:
         (profile_dir / "Bookmarks").write_text(json.dumps(data), encoding="utf-8")
         return len(chosen)
 
+    @staticmethod
+    def _schema_insert(conn, table: str, values: dict, or_clause: str = "OR REPLACE") -> None:
+        """Insert a row using only the columns that actually exist in `table`.
+
+        The browser-primed schema keeps changing which NOT NULL columns it adds
+        (top_frame_site_key, has_expires, source_type, …). Rather than track
+        every version, introspect the live table: for each real column, use the
+        value from `values` if given, else a type-appropriate zero for a
+        NOT NULL column with no default, else let the column default apply.
+        """
+        cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        # cols row: (cid, name, type, notnull, dflt_value, pk)
+        names, placeholders, params = [], [], []
+        for _cid, name, ctype, notnull, dflt, pk in cols:
+            if name in values:
+                names.append(name)
+                placeholders.append("?")
+                params.append(values[name])
+            elif notnull and dflt is None and not pk:
+                names.append(name)
+                placeholders.append("?")
+                t = (ctype or "").upper()
+                params.append("" if ("CHAR" in t or "TEXT" in t or "CLOB" in t) else 0)
+        sql = (
+            f"INSERT {or_clause} INTO {table} ({', '.join(names)}) "
+            f"VALUES ({', '.join(placeholders)})"
+        )
+        conn.execute(sql, params)
+
     def _populate_cookies(self, profile_dir: Path, raw_key: bytes) -> int:
         count = 0
         for db_path in (profile_dir / "Cookies", profile_dir / "Network" / "Cookies"):
@@ -402,17 +431,26 @@ class ChromiumPopulator:
                     host = url.split("//", 1)[1].split("/", 1)[0]
                     enc = encrypt_v10(raw_key, f"demo_session_{uuid.uuid4().hex[:16]}".encode())
                     now = now_chrome_ts()
-                    # The browser-primed schema drops the DEFAULT clauses the
-                    # built-in DDL carries, so every NOT NULL column must be
-                    # supplied explicitly.
-                    conn.execute(
-                        "INSERT OR REPLACE INTO cookies "
-                        "(creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, "
-                        "path, expires_utc, is_secure, is_httponly, last_access_utc, has_expires, "
-                        "is_persistent, priority, samesite, source_scheme, source_port, last_update_utc) "
-                        "VALUES (?, ?, '', 'session_id', '', ?, '/', ?, 1, 1, ?, 1, 1, 1, -1, 2, 443, ?)",
-                        (now, host, enc, now + 30 * 86_400 * 1_000_000, now, now),
-                    )
+                    self._schema_insert(conn, "cookies", {
+                        "creation_utc": now,
+                        "host_key": host,
+                        "top_frame_site_key": "",
+                        "name": "session_id",
+                        "value": "",
+                        "encrypted_value": enc,
+                        "path": "/",
+                        "expires_utc": now + 30 * 86_400 * 1_000_000,
+                        "is_secure": 1,
+                        "is_httponly": 1,
+                        "last_access_utc": now,
+                        "has_expires": 1,
+                        "is_persistent": 1,
+                        "priority": 1,
+                        "samesite": -1,
+                        "source_scheme": 2,
+                        "source_port": 443,
+                        "last_update_utc": now,
+                    })
                     if db_path.name == "Cookies" and db_path.parent == profile_dir:
                         count += 1
                 conn.commit()
