@@ -149,18 +149,22 @@ class ChromiumPopulator:
                 return p
         return None
 
-    def _prime_profile(self, profile_dir: Path, settle: int = 6) -> None:
+    def _prime_profile(self, profile_dir: Path, settle: int = 12) -> None:
         """Run the browser briefly against the new profile so it creates
         History / Web Data / Login Data / Cookies at its own current schema
-        version. The DB files and their schema are written within the first
-        couple of seconds of startup, so we let it run for `settle` seconds,
-        then close it gracefully. Best-effort: if the exe is missing the
-        CREATE TABLE path in each _populate_* still runs.
+        version. Best-effort: if the exe is missing the CREATE TABLE path in
+        each _populate_* still runs.
 
-        We deliberately do NOT hard-kill: a taskkill /F on a starting Chromium
-        triggers its 'quit unexpectedly / restore pages' state on next launch.
-        --headless is passed (harmless where honoured); where a build ignores
-        it and shows a window, the graceful close below still lands."""
+        Key points learned the hard way with Brave:
+        - --no-startup-window is honoured even when --headless is not, so no
+          window ever opens and there is no 'restore pages' tab afterwards.
+        - A taskkill /F on Brave orphans its child processes and trips the
+          'Brave quit unexpectedly' crash state on next launch, so we NEVER
+          use /F here — only a graceful close, then move on. The DB files and
+          their schema are fully written within the first few seconds, well
+          before `settle` elapses, so a slow-to-exit priming process is
+          harmless once we have waited it out.
+        - Never taskkill /IM: that would also close the user's own browser."""
         exe = self._find_exe()
         if exe is None:
             logger.warning(
@@ -173,13 +177,12 @@ class ChromiumPopulator:
             str(exe),
             f'--user-data-dir={self.user_data_dir}',
             f'--profile-directory={self.demo_profile}',
-            "--headless",
-            "--disable-gpu",
+            "--no-startup-window",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-sync",
             "--disable-extensions",
-            "about:blank",
+            "--disable-background-mode",
         ]
         logger.info(f"{self.name}: priming profile via {exe.name}…")
         try:
@@ -198,24 +201,18 @@ class ChromiumPopulator:
         except subprocess.TimeoutExpired:
             pass
 
-        # Chromium on Windows does not respond to proc.terminate() (the child
-        # process tree outlives it) and would leave an about:blank window open,
-        # possibly still holding the profile DBs when we start writing. After
-        # the settle period the browser is fully started, so a PID-scoped
-        # taskkill is clean — no 'quit unexpectedly' prompt (that only happens
-        # when killing a browser mid-startup). Never taskkill /IM: that would
-        # also close the user's own running browser.
+        # Graceful close only. --no-startup-window means Brave has no window and
+        # often exits on its own; if it is still up, ask it to close (no /F).
         if proc.poll() is None:
             logger.info(f"{self.name}: closing priming instance…")
             self._kill_process_tree(proc.pid, force=False)
             try:
-                proc.wait(timeout=6)
+                proc.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                self._kill_process_tree(proc.pid, force=True)
-                try:
-                    proc.wait(timeout=6)
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"{self.name}: priming instance did not exit; continuing anyway.")
+                logger.warning(
+                    f"{self.name}: priming instance slow to exit; continuing "
+                    f"(schema is already written)."
+                )
 
         # Give the OS a moment to release file handles, then drop lock/journal
         # files so our sqlite3 connections open without contention.
