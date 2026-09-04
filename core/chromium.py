@@ -157,13 +157,14 @@ class ChromiumPopulator:
 
         Key points learned the hard way with Brave:
         - --no-startup-window is honoured even when --headless is not, so no
-          window ever opens and there is no 'restore pages' tab afterwards.
-        - A taskkill /F on Brave orphans its child processes and trips the
-          'Brave quit unexpectedly' crash state on next launch, so we NEVER
-          use /F here — only a graceful close, then move on. The DB files and
-          their schema are fully written within the first few seconds, well
-          before `settle` elapses, so a slow-to-exit priming process is
-          harmless once we have waited it out.
+          window opens, but Brave then lingers in the background holding the
+          profile DBs (causing 'database is locked' on our writes), and a
+          graceful close will not shift it.
+        - So we DO force-kill the priming PID tree, then repair the fallout:
+          the only real downside of /F was the 'Brave quit unexpectedly /
+          restore pages' prompt on next open, which comes from
+          Preferences -> profile.exit_type. We rewrite that to "Normal"
+          after the kill, so the real open is clean.
         - Never taskkill /IM: that would also close the user's own browser."""
         exe = self._find_exe()
         if exe is None:
@@ -201,22 +202,24 @@ class ChromiumPopulator:
         except subprocess.TimeoutExpired:
             pass
 
-        # Graceful close only. --no-startup-window means Brave has no window and
-        # often exits on its own; if it is still up, ask it to close (no /F).
+        # Force-close the priming PID tree: --no-startup-window leaves Brave
+        # running in the background with the DBs locked, and a graceful close
+        # will not move it. Try graceful once (cheap), then /F.
         if proc.poll() is None:
             logger.info(f"{self.name}: closing priming instance…")
             self._kill_process_tree(proc.pid, force=False)
             try:
-                proc.wait(timeout=8)
+                proc.wait(timeout=4)
             except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"{self.name}: priming instance slow to exit; continuing "
-                    f"(schema is already written)."
-                )
+                self._kill_process_tree(proc.pid, force=True)
+                try:
+                    proc.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"{self.name}: priming instance did not exit; continuing.")
 
-        # Give the OS a moment to release file handles, then drop lock/journal
-        # files so our sqlite3 connections open without contention.
-        time.sleep(1.5)
+        # Wait for handles to release, then clear journal/lock files and repair
+        # the exit_type marker so the real open does not show a crash prompt.
+        time.sleep(2.0)
         for db in ("History", "Web Data", "Login Data", "Cookies"):
             for base in (profile_dir / db, profile_dir / "Network" / db):
                 for suf in _PRIME_LOCK_SUFFIXES:
@@ -227,6 +230,25 @@ class ChromiumPopulator:
                         pass
                     except OSError as exc:
                         logger.debug(f"could not remove {lock}: {exc}")
+        self._mark_clean_exit(profile_dir)
+
+    def _mark_clean_exit(self, profile_dir: Path) -> None:
+        """Set profile.exit_type = Normal in Preferences so the browser does not
+        offer 'restore pages' after we force-killed the priming instance."""
+        path = profile_dir / "Preferences"
+        if not path.exists():
+            return
+        try:
+            prefs = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        prof = prefs.setdefault("profile", {})
+        prof["exit_type"] = "Normal"
+        prof["exited_cleanly"] = True
+        try:
+            path.write_text(json.dumps(prefs), encoding="utf-8")
+        except OSError as exc:
+            logger.debug(f"could not rewrite Preferences: {exc}")
 
     def _kill_process_tree(self, pid: int, force: bool = True) -> None:
         """Close the priming process and its children by PID, so a user's own
