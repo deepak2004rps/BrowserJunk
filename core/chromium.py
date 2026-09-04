@@ -138,12 +138,16 @@ class ChromiumPopulator:
                 return p
         return None
 
-    def _prime_profile(self, profile_dir: Path, timeout: int = 30) -> None:
-        """Run the browser once, headless, so it builds the profile's SQLite
-        stores at the correct schema version, then exits. Best-effort: if the
-        exe can't be found or doesn't exit cleanly, fall back to the
-        CREATE TABLE path in each _populate_* (works, but risks a migration on
-        a newer browser build)."""
+    def _prime_profile(self, profile_dir: Path, timeout: int = 25) -> None:
+        """Run the browser once against the new profile so it builds History /
+        Web Data / Login Data / Cookies at its own current schema version, then
+        exits. Best-effort: if the exe is missing or does not exit cleanly, the
+        CREATE TABLE path in each _populate_* still runs (works, but risks a
+        migration on a newer browser build).
+
+        Uses old --headless with --dump-dom, which reliably renders one page and
+        exits on every Chromium/Brave build (the newer --headless=new can still
+        pop a visible window on some builds and wait to be closed)."""
         exe = self._find_exe()
         if exe is None:
             logger.warning(
@@ -156,13 +160,14 @@ class ChromiumPopulator:
             str(exe),
             f'--user-data-dir={self.user_data_dir}',
             f'--profile-directory={self.demo_profile}',
-            "--headless=new",
+            "--headless",
+            "--disable-gpu",
             "--no-first-run",
             "--no-default-browser-check",
-            "--no-startup-window",
-            "--disable-gpu",
             "--disable-sync",
             "--disable-extensions",
+            "--dump-dom",
+            "about:blank",
         ]
         logger.info(f"{self.name}: priming profile via {exe.name} (headless)…")
         try:
@@ -179,7 +184,8 @@ class ChromiumPopulator:
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            logger.warning(f"{self.name}: priming did not exit in {timeout}s, killing.")
+            self._kill_process_tree(proc.pid)
             proc.wait()
 
         # Give the OS a moment to release file handles, then drop lock/journal
@@ -195,6 +201,21 @@ class ChromiumPopulator:
                         pass
                     except OSError as exc:
                         logger.debug(f"could not remove {lock}: {exc}")
+
+    def _kill_process_tree(self, pid: int) -> None:
+        """Kill only the priming process and its children by PID, so a user's
+        own running browser (different PID tree) is never touched."""
+        if os.name != "nt":
+            return
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
 
     def _register_in_profile_picker(self) -> None:
         """Add the demo profile to Local State's info_cache so it shows up
