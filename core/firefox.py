@@ -9,6 +9,7 @@ from __future__ import annotations
 import configparser
 import json
 import random
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -17,6 +18,10 @@ from core.browsers import DataCategory
 from core.helpers import ensure_dir, firefox_random_us, get_logger, url_hash
 
 logger = get_logger("firefox")
+
+
+def _persona_slug(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", name.title()) or "User"
 
 _DEMO_SITES = [
     ("https://news.ycombinator.com/", "Hacker News"),
@@ -50,48 +55,62 @@ class FirefoxPopulator:
         self.dry_run = dry_run
         self.demo_profile = demo_profile
 
+    def profile_name_for(self, persona) -> str:
+        """One Firefox profile per persona."""
+        return f"{self.demo_profile}_{_persona_slug(persona.full_name)}"
+
     def run(self) -> dict[str, dict[str, int]]:
-        profile_name = f"{self.demo_profile}.default-release"
-        profile_dir = self.root_dir / "Profiles" / profile_name
-        label = f"{self.name} / {self.demo_profile}"
+        """Create ONE Firefox profile per assigned persona; each holds only
+        that persona's data."""
+        all_results: dict[str, dict[str, int]] = {}
 
-        if self.dry_run:
-            logger.info(f"[dry-run] {self.name}: would create profile at {profile_dir}")
-            return {label: {cat: self._estimate(cat) for cat in self.categories}}
+        for persona in self.personas:
+            base = self.profile_name_for(persona)
+            profile_name = f"{base}.default-release"
+            profile_dir = self.root_dir / "Profiles" / profile_name
+            label = f"{self.name} / {base}"
 
-        ensure_dir(profile_dir)
-        self._register_profile(profile_name)
+            if self.dry_run:
+                logger.info(f"[dry-run] {self.name}: would create profile at {profile_dir}")
+                all_results[label] = {cat: self._estimate(cat) for cat in self.categories}
+                continue
 
-        counts: dict[str, int] = {}
-        if DataCategory.HISTORY in self.categories or DataCategory.BOOKMARKS in self.categories:
-            hist, marks = self._populate_places(profile_dir)
-            if DataCategory.HISTORY in self.categories:
-                counts[DataCategory.HISTORY] = hist
-            if DataCategory.BOOKMARKS in self.categories:
-                counts[DataCategory.BOOKMARKS] = marks
-        if DataCategory.COOKIES in self.categories:
-            counts[DataCategory.COOKIES] = self._populate_cookies(profile_dir)
-        if DataCategory.AUTOFILL in self.categories:
-            counts[DataCategory.AUTOFILL] = self._populate_form_history(profile_dir)
-        if DataCategory.PASSWORDS in self.categories:
-            counts[DataCategory.PASSWORDS] = self._populate_passwords(profile_dir)
+            logger.info(f"{self.name}: building profile '{base}' for {persona.full_name}")
+            ensure_dir(profile_dir)
+            self._register_profile(profile_name, base)
 
-        logger.info(f"{self.name}: populated profile at {profile_dir}")
-        return {label: counts}
+            counts: dict[str, int] = {}
+            if DataCategory.HISTORY in self.categories or DataCategory.BOOKMARKS in self.categories:
+                hist, marks = self._populate_places(profile_dir, persona)
+                if DataCategory.HISTORY in self.categories:
+                    counts[DataCategory.HISTORY] = hist
+                if DataCategory.BOOKMARKS in self.categories:
+                    counts[DataCategory.BOOKMARKS] = marks
+            if DataCategory.COOKIES in self.categories:
+                counts[DataCategory.COOKIES] = self._populate_cookies(profile_dir, persona)
+            if DataCategory.AUTOFILL in self.categories:
+                counts[DataCategory.AUTOFILL] = self._populate_form_history(profile_dir, persona)
+            if DataCategory.PASSWORDS in self.categories:
+                counts[DataCategory.PASSWORDS] = self._populate_passwords(profile_dir, persona)
+
+            logger.info(f"{self.name}: populated profile at {profile_dir}")
+            all_results[label] = counts
+
+        return all_results
 
     def _estimate(self, cat: str) -> int:
-        n = len(self.personas)
+        # per-profile estimate: one persona's worth
         if cat in (DataCategory.HISTORY, DataCategory.COOKIES):
-            return n * len(_DEMO_SITES)
+            return len(_DEMO_SITES)
         if cat == DataCategory.BOOKMARKS:
-            return n * (len(_DEMO_SITES) // 2)
+            return len(_DEMO_SITES) // 2
         if cat == DataCategory.AUTOFILL:
-            return n * 7
+            return 7
         if cat == DataCategory.PASSWORDS:
-            return sum(len(p.passwords) for p in self.personas)
+            return sum(len(p.passwords) for p in self.personas[:1])
         return 0
 
-    def _register_profile(self, profile_name: str) -> None:
+    def _register_profile(self, profile_name: str, display_name: str) -> None:
         ini_path = self.root_dir / "profiles.ini"
         config = configparser.ConfigParser()
         if ini_path.exists():
@@ -103,7 +122,7 @@ class FirefoxPopulator:
 
         idx = sum(1 for s in config.sections() if s.startswith("Profile"))
         config[f"Profile{idx}"] = {
-            "Name": self.demo_profile, "IsRelative": "1", "Path": f"Profiles/{profile_name}",
+            "Name": display_name, "IsRelative": "1", "Path": f"Profiles/{profile_name}",
         }
         if "General" not in config.sections():
             config["General"] = {"StartWithLastProfile": "1", "Version": "2"}
@@ -112,7 +131,7 @@ class FirefoxPopulator:
         with open(ini_path, "w", encoding="utf-8") as fh:
             config.write(fh, space_around_delimiters=False)
 
-    def _populate_places(self, profile_dir: Path) -> tuple[int, int]:
+    def _populate_places(self, profile_dir: Path, persona) -> tuple[int, int]:
         conn = sqlite3.connect(str(profile_dir / "places.sqlite"))
         try:
             conn.executescript(
@@ -138,38 +157,37 @@ class FirefoxPopulator:
             )
             hist_count = 0
             mark_count = 0
-            for _persona in self.personas:
-                bookmarked = {u for u, _t in random.sample(_DEMO_SITES, len(_DEMO_SITES) // 2)}
-                for url, title in _DEMO_SITES:
-                    host = url.split("//", 1)[1].split("/", 1)[0]
-                    rev_host = "." + host[::-1] + "."
-                    visits = random.randint(1, 6)
-                    cur = conn.execute(
-                        "INSERT INTO moz_places (url, title, rev_host, visit_count, last_visit_date, guid, url_hash) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (url, title, rev_host, visits, firefox_random_us(1), uuid.uuid4().hex[:12], url_hash(url)),
+            bookmarked = {u for u, _t in random.sample(_DEMO_SITES, len(_DEMO_SITES) // 2)}
+            for url, title in _DEMO_SITES:
+                host = url.split("//", 1)[1].split("/", 1)[0]
+                rev_host = "." + host[::-1] + "."
+                visits = random.randint(1, 6)
+                cur = conn.execute(
+                    "INSERT INTO moz_places (url, title, rev_host, visit_count, last_visit_date, guid, url_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (url, title, rev_host, visits, firefox_random_us(1), uuid.uuid4().hex[:12], url_hash(url)),
+                )
+                place_id = cur.lastrowid
+                for _v in range(visits):
+                    conn.execute(
+                        "INSERT INTO moz_historyvisits (place_id, visit_date, visit_type, session) "
+                        "VALUES (?, ?, 1, 0)",
+                        (place_id, firefox_random_us(365)),
                     )
-                    place_id = cur.lastrowid
-                    for _v in range(visits):
-                        conn.execute(
-                            "INSERT INTO moz_historyvisits (place_id, visit_date, visit_type, session) "
-                            "VALUES (?, ?, 1, 0)",
-                            (place_id, firefox_random_us(365)),
-                        )
-                    hist_count += 1
-                    if url in bookmarked:
-                        conn.execute(
-                            "INSERT INTO moz_bookmarks (type, fk, parent, position, title, dateAdded, lastModified, guid) "
-                            "VALUES (1, ?, 1, ?, ?, ?, ?, ?)",
-                            (place_id, mark_count, title, firefox_random_us(1), firefox_random_us(1), uuid.uuid4().hex[:12]),
-                        )
-                        mark_count += 1
+                hist_count += 1
+                if url in bookmarked:
+                    conn.execute(
+                        "INSERT INTO moz_bookmarks (type, fk, parent, position, title, dateAdded, lastModified, guid) "
+                        "VALUES (1, ?, 1, ?, ?, ?, ?, ?)",
+                        (place_id, mark_count, title, firefox_random_us(1), firefox_random_us(1), uuid.uuid4().hex[:12]),
+                    )
+                    mark_count += 1
             conn.commit()
             return hist_count, mark_count
         finally:
             conn.close()
 
-    def _populate_cookies(self, profile_dir: Path) -> int:
+    def _populate_cookies(self, profile_dir: Path, persona) -> int:
         conn = sqlite3.connect(str(profile_dir / "cookies.sqlite"))
         try:
             conn.executescript(
@@ -199,7 +217,7 @@ class FirefoxPopulator:
         finally:
             conn.close()
 
-    def _populate_form_history(self, profile_dir: Path) -> int:
+    def _populate_form_history(self, profile_dir: Path, persona) -> int:
         conn = sqlite3.connect(str(profile_dir / "formhistory.sqlite"))
         try:
             conn.executescript(
@@ -211,27 +229,26 @@ class FirefoxPopulator:
                 """
             )
             count = 0
-            for persona in self.personas:
-                fields = {
-                    "email": persona.email, "name": persona.full_name,
-                    "phone": persona.phone, "address": persona.address.street,
-                    "city": persona.address.city, "zip": persona.address.zip_code,
-                    "search": "demo query",
-                }
-                for field, value in fields.items():
-                    now = firefox_random_us(0)
-                    conn.execute(
-                        "INSERT INTO moz_formhistory (fieldname, value, timesUsed, firstUsed, lastUsed, guid) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (field, value, random.randint(1, 5), firefox_random_us(365), now, uuid.uuid4().hex[:12]),
-                    )
-                    count += 1
+            fields = {
+                "email": persona.email, "name": persona.full_name,
+                "phone": persona.phone, "address": persona.address.street,
+                "city": persona.address.city, "zip": persona.address.zip_code,
+                "search": "demo query",
+            }
+            for field, value in fields.items():
+                now = firefox_random_us(0)
+                conn.execute(
+                    "INSERT INTO moz_formhistory (fieldname, value, timesUsed, firstUsed, lastUsed, guid) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (field, value, random.randint(1, 5), firefox_random_us(365), now, uuid.uuid4().hex[:12]),
+                )
+                count += 1
             conn.commit()
             return count
         finally:
             conn.close()
 
-    def _populate_passwords(self, profile_dir: Path) -> int:
+    def _populate_passwords(self, profile_dir: Path, persona) -> int:
         from core.nss import NSSSession
 
         try:
@@ -243,26 +260,25 @@ class FirefoxPopulator:
         entries = []
         next_id = 1
         with session:
-            for persona in self.personas:
-                for pw in persona.passwords:
-                    now_ms = firefox_random_us(0) // 1000
-                    entries.append({
-                        "id": next_id,
-                        "hostname": pw.signon_realm.rstrip("/"),
-                        "httpRealm": None,
-                        "formSubmitURL": pw.signon_realm.rstrip("/"),
-                        "usernameField": "",
-                        "passwordField": "",
-                        "encryptedUsername": session.encrypt(pw.username),
-                        "encryptedPassword": session.encrypt(pw.password),
-                        "guid": "{" + str(uuid.uuid4()) + "}",
-                        "encType": 1,
-                        "timeCreated": now_ms,
-                        "timeLastUsed": now_ms,
-                        "timePasswordChanged": now_ms,
-                        "timesUsed": random.randint(1, 5),
-                    })
-                    next_id += 1
+            for pw in persona.passwords:
+                now_ms = firefox_random_us(0) // 1000
+                entries.append({
+                    "id": next_id,
+                    "hostname": pw.signon_realm.rstrip("/"),
+                    "httpRealm": None,
+                    "formSubmitURL": pw.signon_realm.rstrip("/"),
+                    "usernameField": "",
+                    "passwordField": "",
+                    "encryptedUsername": session.encrypt(pw.username),
+                    "encryptedPassword": session.encrypt(pw.password),
+                    "guid": "{" + str(uuid.uuid4()) + "}",
+                    "encType": 1,
+                    "timeCreated": now_ms,
+                    "timeLastUsed": now_ms,
+                    "timePasswordChanged": now_ms,
+                    "timesUsed": random.randint(1, 5),
+                })
+                next_id += 1
 
         data = {
             "nextId": next_id,

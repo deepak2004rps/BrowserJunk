@@ -40,24 +40,28 @@ from core.helpers import OUTPUT_DIR, get_logger, save_reports
 _CHROMIUM_EXE = {"chrome": "chrome.exe", "edge": "msedge.exe", "brave": "brave.exe"}
 
 
-def _write_launcher(pop) -> Path | None:
-    """Write a one-click .bat that opens this exact demo profile directly,
-    bypassing the fact that a normal double-click always reopens the last
-    active profile instead of a newly created one."""
-    if pop.key == "firefox":
-        exe, args = "firefox.exe", f'-P "{pop.demo_profile}"'
-    else:
-        exe = _CHROMIUM_EXE.get(pop.key)
-        if not exe:
-            return None
-        args = f'--profile-directory="{pop.demo_profile}"'
+def _write_launchers(pop) -> list[Path]:
+    """Write one .bat per generated profile that opens that exact profile
+    directly, bypassing the fact that a normal double-click always reopens
+    the last active profile instead of a newly created one."""
+    written: list[Path] = []
+    for persona in pop.personas:
+        profile_name = pop.profile_name_for(persona)
+        if pop.key == "firefox":
+            exe, args = "firefox.exe", f'-P "{profile_name}"'
+        else:
+            exe = _CHROMIUM_EXE.get(pop.key)
+            if not exe:
+                continue
+            args = f'--profile-directory="{profile_name}"'
 
-    path = OUTPUT_DIR / f"open_{pop.key}_{pop.demo_profile}.bat"
-    path.write_text(
-        f'@echo off\r\nstart "" "{exe}" {args}\r\n',
-        encoding="utf-8",
-    )
-    return path
+        path = OUTPUT_DIR / f"open_{pop.key}_{profile_name}.bat"
+        path.write_text(
+            f'@echo off\r\nstart "" "{exe}" {args}\r\n',
+            encoding="utf-8",
+        )
+        written.append(path)
+    return written
 
 console = Console()
 logger = get_logger("cli")
@@ -106,10 +110,11 @@ ALL_BROWSERS = list(BROWSER_REGISTRY.keys())
 )
 @click.option(
     "--personas", "-n",
-    default=_CONFIG.get("personas", 1),
+    default=_CONFIG.get("personas", 2),
     show_default=True,
     type=click.IntRange(1, 10),
-    help="Number of synthetic personas to generate.",
+    help="Profiles (unique personas) to create per browser. Personas are never "
+         "shared between browsers.",
 )
 @click.option(
     "--seed", "-s",
@@ -200,21 +205,12 @@ def main(
     if dry_run:
         console.print(Panel("[yellow]DRY RUN MODE – no files will be written.[/yellow]", style="yellow"))
 
-    # ── Generate personas ─────────────────────────────────────────────────
-    console.print(f"\n[cyan]Generating {personas} persona(s)…[/cyan]")
-    persona_list = generate_personas(count=personas, base_seed=seed)
-    for p in persona_list:
-        console.print(
-            f"  [green]✓[/green] [bold]{p.full_name}[/bold] "
-            f"<{p.email}> · {len(p.passwords)} passwords · {len(p.cards)} card(s)"
-        )
-
-    # ── Build populators ──────────────────────────────────────────────────
+    # ── Build populators first, so we know how many browsers we target ────
     console.print("\n[cyan]Building browser populators…[/cyan]")
     try:
         pop_list = build_populators(
             browser_keys=browser_list,
-            personas=persona_list,
+            personas=[],  # assigned below
             categories=category_set,
             dry_run=dry_run,
             demo_profile=profile_name,
@@ -232,7 +228,24 @@ def main(
         )
         sys.exit(0)
 
-    console.print(f"  Targeting [bold]{len(pop_list)}[/bold] browser(s): "
+    # ── Generate a disjoint set of personas per browser ──────────────────
+    total_personas = personas * len(pop_list)
+    console.print(
+        f"\n[cyan]Generating {total_personas} persona(s) "
+        f"— {personas} per browser, none shared…[/cyan]"
+    )
+    persona_list = generate_personas(count=total_personas, base_seed=seed)
+
+    for i, pop in enumerate(pop_list):
+        pop.personas = persona_list[i * personas:(i + 1) * personas]
+        console.print(f"  [bold]{pop.name}[/bold]:")
+        for p in pop.personas:
+            console.print(
+                f"    [green]✓[/green] {p.full_name} "
+                f"<{p.email}> · {len(p.passwords)} passwords · {len(p.cards)} card(s)"
+            )
+
+    console.print(f"\n  Targeting [bold]{len(pop_list)}[/bold] browser(s): "
                   f"{', '.join(p.name for p in pop_list)}")
 
     # ── Run population ────────────────────────────────────────────────────
@@ -247,9 +260,7 @@ def main(
         all_results.update(result)
         browsers_run.append(pop.name)
         if not dry_run:
-            launcher = _write_launcher(pop)
-            if launcher:
-                launchers.append(launcher)
+            launchers.extend(_write_launchers(pop))
 
     elapsed = time.time() - start
     console.rule("[bold green]Complete[/bold green]")

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -39,6 +40,11 @@ _EXE_CANDIDATES = {
     ],
 }
 _EXE_NAME = {"chrome": "chrome.exe", "edge": "msedge.exe", "brave": "brave.exe"}
+
+
+def _persona_slug(name: str) -> str:
+    """'Martin Norton' -> 'MartinNorton', safe for a profile directory name."""
+    return re.sub(r"[^A-Za-z0-9]+", "", name.title()) or "User"
 
 # Files the browser creates/locks while priming; removed afterwards so our
 # INSERTs open cleanly.
@@ -76,66 +82,74 @@ class ChromiumPopulator:
         self.dry_run = dry_run
         self.demo_profile = demo_profile
 
+    def profile_name_for(self, persona) -> str:
+        """One profile directory per persona: BVaultDemo_<ts>_<PersonaName>."""
+        return f"{self.demo_profile}_{_persona_slug(persona.full_name)}"
+
     def run(self) -> dict[str, dict[str, int]]:
-        profile_dir = self.user_data_dir / self.demo_profile
-        label = f"{self.name} / {self.demo_profile}"
+        """Create ONE profile per assigned persona (2 personas -> 2 users in the
+        browser). Each profile holds only its own persona's data."""
+        all_results: dict[str, dict[str, int]] = {}
 
-        if self.dry_run:
-            logger.info(f"[dry-run] {self.name}: would create profile at {profile_dir}")
-            return {label: {cat: self._estimate(cat) for cat in self.categories}}
+        for persona in self.personas:
+            profile_name = self.profile_name_for(persona)
+            profile_dir = self.user_data_dir / profile_name
+            label = f"{self.name} / {profile_name}"
 
-        ensure_dir(profile_dir)
-        ensure_dir(profile_dir / "Network")
-        self._write_preferences(profile_dir)
-
-        # Let the real browser create History / Web Data / Login Data / Cookies
-        # at its own current schema version, so no migration runs on first open
-        # and our INSERTs land in tables Chromium actually recognises.
-        self._prime_profile(profile_dir)
-
-        # Register in the profile picker AFTER priming: the priming browser
-        # rewrites Local State from its own state on exit and would drop an
-        # info_cache entry added beforehand.
-        self._register_in_profile_picker()
-
-        raw_key = None
-        if self.categories & {DataCategory.PASSWORDS, DataCategory.COOKIES, DataCategory.AUTOFILL}:
-            raw_key = get_or_create_os_crypt_key(self.user_data_dir)
-
-        jobs = [
-            (DataCategory.HISTORY,   lambda: self._populate_history(profile_dir)),
-            (DataCategory.BOOKMARKS, lambda: self._populate_bookmarks(profile_dir)),
-            (DataCategory.COOKIES,   lambda: self._populate_cookies(profile_dir, raw_key)),
-            (DataCategory.PASSWORDS, lambda: self._populate_passwords(profile_dir, raw_key)),
-            (DataCategory.AUTOFILL,  lambda: self._populate_autofill(profile_dir, raw_key)),
-        ]
-        counts: dict[str, int] = {}
-        for cat, fn in jobs:
-            if cat not in self.categories:
+            if self.dry_run:
+                logger.info(f"[dry-run] {self.name}: would create profile at {profile_dir}")
+                all_results[label] = {cat: self._estimate(cat) for cat in self.categories}
                 continue
-            try:
-                counts[cat] = fn()
-            except sqlite3.Error as exc:
-                # A primed profile can carry a newer store schema than this tool
-                # writes for. Skip that category rather than abort the whole run.
-                logger.warning(f"{self.name}: skipping {cat} — {exc}")
-                counts[cat] = 0
 
-        logger.info(f"{self.name}: populated profile at {profile_dir}")
-        return {label: counts}
+            logger.info(f"{self.name}: building profile '{profile_name}' for {persona.full_name}")
+            ensure_dir(profile_dir)
+            ensure_dir(profile_dir / "Network")
+            self._write_preferences(profile_dir, persona)
+
+            # Let the real browser create History / Web Data / Login Data /
+            # Cookies at its own current schema version, so no migration runs on
+            # first open and our INSERTs land in tables Chromium recognises.
+            self._prime_profile(profile_dir, profile_name)
+            self._register_in_profile_picker(profile_name, persona)
+
+            raw_key = None
+            if self.categories & {DataCategory.PASSWORDS, DataCategory.COOKIES, DataCategory.AUTOFILL}:
+                raw_key = get_or_create_os_crypt_key(self.user_data_dir)
+
+            jobs = [
+                (DataCategory.HISTORY,   lambda p=profile_dir, pe=persona: self._populate_history(p, pe)),
+                (DataCategory.BOOKMARKS, lambda p=profile_dir, pe=persona: self._populate_bookmarks(p, pe)),
+                (DataCategory.COOKIES,   lambda p=profile_dir, pe=persona: self._populate_cookies(p, pe, raw_key)),
+                (DataCategory.PASSWORDS, lambda p=profile_dir, pe=persona: self._populate_passwords(p, pe, raw_key)),
+                (DataCategory.AUTOFILL,  lambda p=profile_dir, pe=persona: self._populate_autofill(p, pe, raw_key)),
+            ]
+            counts: dict[str, int] = {}
+            for cat, fn in jobs:
+                if cat not in self.categories:
+                    continue
+                try:
+                    counts[cat] = fn()
+                except sqlite3.Error as exc:
+                    logger.warning(f"{self.name}/{profile_name}: skipping {cat} — {exc}")
+                    counts[cat] = 0
+
+            logger.info(f"{self.name}: populated profile at {profile_dir}")
+            all_results[label] = counts
+
+        return all_results
 
     def _estimate(self, cat: str) -> int:
-        n = len(self.personas)
+        # per-profile estimate: one persona's worth of data
         if cat == DataCategory.HISTORY:
-            return n * len(_DEMO_SITES)
+            return len(_DEMO_SITES)
         if cat == DataCategory.BOOKMARKS:
-            return n * (len(_DEMO_SITES) // 2)
+            return len(_DEMO_SITES) // 2
         if cat == DataCategory.COOKIES:
-            return n * len(_DEMO_SITES)
+            return len(_DEMO_SITES)
         if cat == DataCategory.PASSWORDS:
-            return sum(len(p.passwords) for p in self.personas)
+            return sum(len(p.passwords) for p in self.personas[:1])
         if cat == DataCategory.AUTOFILL:
-            return sum(7 + len(p.cards) for p in self.personas)
+            return sum(7 + len(p.cards) for p in self.personas[:1])
         return 0
 
     def _find_exe(self) -> Path | None:
@@ -149,7 +163,7 @@ class ChromiumPopulator:
                 return p
         return None
 
-    def _prime_profile(self, profile_dir: Path, settle: int = 12) -> None:
+    def _prime_profile(self, profile_dir: Path, profile_name: str, settle: int = 12) -> None:
         """Run the browser briefly against the new profile so it creates
         History / Web Data / Login Data / Cookies at its own current schema
         version. Best-effort: if the exe is missing the CREATE TABLE path in
@@ -177,7 +191,7 @@ class ChromiumPopulator:
         cmd = [
             str(exe),
             f'--user-data-dir={self.user_data_dir}',
-            f'--profile-directory={self.demo_profile}',
+            f'--profile-directory={profile_name}',
             "--no-startup-window",
             "--no-first-run",
             "--no-default-browser-check",
@@ -269,11 +283,10 @@ class ChromiumPopulator:
         except OSError:
             pass
 
-    def _register_in_profile_picker(self) -> None:
-        """Add the demo profile to Local State's info_cache so it shows up
-        in the browser's own profile-switcher menu (top-right avatar).
-        Without this the browser has no idea the folder is a profile and
-        opening the browser normally will just show the Default profile."""
+    def _register_in_profile_picker(self, profile_name: str, persona) -> None:
+        """Add a demo profile to Local State's info_cache so it shows up in the
+        browser's profile-switcher (top-right avatar). Called once per persona;
+        re-reads Local State each time so multiple profiles all land."""
         path = self.user_data_dir / "Local State"
         state = {}
         if path.exists():
@@ -282,23 +295,22 @@ class ChromiumPopulator:
             except (json.JSONDecodeError, OSError):
                 state = {}
 
-        display_name = self.personas[0].full_name if self.personas else self.demo_profile
         profile_block = state.setdefault("profile", {})
         info_cache = profile_block.setdefault("info_cache", {})
-        info_cache[self.demo_profile] = {
-            "name": display_name,
+        info_cache[profile_name] = {
+            "name": persona.full_name,
             "user_name": "",
             "is_using_default_avatar": True,
             "is_using_default_name": False,
             "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_0",
         }
         order = profile_block.setdefault("profiles_order", [])
-        if self.demo_profile not in order:
-            order.append(self.demo_profile)
+        if profile_name not in order:
+            order.append(profile_name)
 
         path.write_text(json.dumps(state), encoding="utf-8")
 
-    def _write_preferences(self, profile_dir: Path) -> None:
+    def _write_preferences(self, profile_dir: Path, persona) -> None:
         """Write a minimally-valid Preferences file. A bare {"profile":{"name":...}}
         stub is rejected on load ("Something went wrong when opening your profile"):
         Chromium expects the profile block to carry creation metadata and a clean
@@ -311,11 +323,10 @@ class ChromiumPopulator:
             except (json.JSONDecodeError, OSError):
                 prefs = {}
 
-        display_name = self.personas[0].full_name if self.personas else self.demo_profile
         now_us = now_chrome_ts()
 
         profile = prefs.setdefault("profile", {})
-        profile["name"] = display_name
+        profile["name"] = persona.full_name
         profile.setdefault("created_by_version", "120.0.0.0")
         profile.setdefault("creation_time", str(now_us))
         profile.setdefault("exit_type", "Normal")
@@ -332,7 +343,7 @@ class ChromiumPopulator:
 
         path.write_text(json.dumps(prefs), encoding="utf-8")
 
-    def _populate_history(self, profile_dir: Path) -> int:
+    def _populate_history(self, profile_dir: Path, persona) -> int:
         conn = sqlite3.connect(str(profile_dir / "History"))
         try:
             conn.executescript(
@@ -357,27 +368,26 @@ class ChromiumPopulator:
             conn.execute("INSERT OR IGNORE INTO meta VALUES ('last_compatible_version', '16')")
 
             count = 0
-            for _persona in self.personas:
-                for url, title in _DEMO_SITES:
-                    visits = random.randint(1, 6)
-                    cur = conn.execute(
-                        "INSERT INTO urls (url, title, visit_count, typed_count, last_visit_time, hidden) "
-                        "VALUES (?, ?, ?, ?, ?, 0)",
-                        (url, title, visits, random.randint(0, 2), now_chrome_ts()),
+            for url, title in _DEMO_SITES:
+                visits = random.randint(1, 6)
+                cur = conn.execute(
+                    "INSERT INTO urls (url, title, visit_count, typed_count, last_visit_time, hidden) "
+                    "VALUES (?, ?, ?, ?, ?, 0)",
+                    (url, title, visits, random.randint(0, 2), now_chrome_ts()),
+                )
+                url_id = cur.lastrowid
+                for _v in range(visits):
+                    conn.execute(
+                        "INSERT INTO visits (url, visit_time, from_visit, transition) VALUES (?, ?, 0, ?)",
+                        (url_id, random_past_chrome_ts(), 805306368),
                     )
-                    url_id = cur.lastrowid
-                    for _v in range(visits):
-                        conn.execute(
-                            "INSERT INTO visits (url, visit_time, from_visit, transition) VALUES (?, ?, 0, ?)",
-                            (url_id, random_past_chrome_ts(), 805306368),
-                        )
-                    count += 1
+                count += 1
             conn.commit()
             return count
         finally:
             conn.close()
 
-    def _populate_bookmarks(self, profile_dir: Path) -> int:
+    def _populate_bookmarks(self, profile_dir: Path, persona) -> int:
         chosen = random.sample(_DEMO_SITES, len(_DEMO_SITES) // 2)
         next_id = 3
         children = []
@@ -439,7 +449,7 @@ class ChromiumPopulator:
         )
         conn.execute(sql, params)
 
-    def _populate_cookies(self, profile_dir: Path, raw_key: bytes) -> int:
+    def _populate_cookies(self, profile_dir: Path, persona, raw_key: bytes) -> int:
         count = 0
         for db_path in (profile_dir / "Cookies", profile_dir / "Network" / "Cookies"):
             conn = sqlite3.connect(str(db_path))
@@ -495,7 +505,7 @@ class ChromiumPopulator:
                 conn.close()
         return count
 
-    def _populate_passwords(self, profile_dir: Path, raw_key: bytes) -> int:
+    def _populate_passwords(self, profile_dir: Path, persona, raw_key: bytes) -> int:
         conn = sqlite3.connect(str(profile_dir / "Login Data"))
         try:
             conn.executescript(
@@ -523,25 +533,24 @@ class ChromiumPopulator:
 
             count = 0
             now = now_chrome_ts()
-            for persona in self.personas:
-                for pw in persona.passwords:
-                    enc = encrypt_v10(raw_key, pw.password.encode())
-                    conn.execute(
-                        "INSERT OR IGNORE INTO logins "
-                        "(origin_url, action_url, username_element, username_value, password_element, "
-                        "password_value, submit_element, signon_realm, date_created, blacklisted_by_user, "
-                        "scheme, times_used, skip_zero_click, generation_upload_status, date_last_used, "
-                        "date_password_modified) "
-                        "VALUES (?, ?, '', ?, '', ?, '', ?, ?, 0, 0, 1, 1, 0, ?, ?)",
-                        (pw.site_url, pw.site_url, pw.username, enc, pw.signon_realm, now, now, now),
-                    )
-                    count += 1
+            for pw in persona.passwords:
+                enc = encrypt_v10(raw_key, pw.password.encode())
+                conn.execute(
+                    "INSERT OR IGNORE INTO logins "
+                    "(origin_url, action_url, username_element, username_value, password_element, "
+                    "password_value, submit_element, signon_realm, date_created, blacklisted_by_user, "
+                    "scheme, times_used, skip_zero_click, generation_upload_status, date_last_used, "
+                    "date_password_modified) "
+                    "VALUES (?, ?, '', ?, '', ?, '', ?, ?, 0, 0, 1, 1, 0, ?, ?)",
+                    (pw.site_url, pw.site_url, pw.username, enc, pw.signon_realm, now, now, now),
+                )
+                count += 1
             conn.commit()
             return count
         finally:
             conn.close()
 
-    def _populate_autofill(self, profile_dir: Path, raw_key: bytes) -> int:
+    def _populate_autofill(self, profile_dir: Path, persona, raw_key: bytes) -> int:
         conn = sqlite3.connect(str(profile_dir / "Web Data"))
         try:
             conn.executescript(
@@ -567,31 +576,30 @@ class ChromiumPopulator:
             count = 0
             now_s = int(now_chrome_ts() / 1_000_000)
             now = now_chrome_ts()
-            for persona in self.personas:
-                fields = {
-                    "email": persona.email, "name": persona.full_name,
-                    "phone": persona.phone, "address": persona.address.street,
-                    "city": persona.address.city, "zip": persona.address.zip_code,
-                    "search": "demo query",
-                }
-                for field, value in fields.items():
-                    conn.execute(
-                        "INSERT OR IGNORE INTO autofill (name, value, value_lower, date_created, date_last_used, count) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (field, value, value.lower(), now_s, now_s, random.randint(1, 5)),
-                    )
-                    count += 1
-                for card in persona.cards:
-                    enc = encrypt_v10(raw_key, card.number.encode())
-                    conn.execute(
-                        "INSERT OR IGNORE INTO credit_cards "
-                        "(guid, name_on_card, expiration_month, expiration_year, card_number_encrypted, "
-                        "date_modified, use_count, use_date, nickname) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (str(uuid.uuid4()), card.cardholder_name, card.expiry_month, card.expiry_year,
-                         enc, now, random.randint(1, 4), now, f"{card.card_type} demo"),
-                    )
-                    count += 1
+            fields = {
+                "email": persona.email, "name": persona.full_name,
+                "phone": persona.phone, "address": persona.address.street,
+                "city": persona.address.city, "zip": persona.address.zip_code,
+                "search": "demo query",
+            }
+            for field, value in fields.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO autofill (name, value, value_lower, date_created, date_last_used, count) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (field, value, value.lower(), now_s, now_s, random.randint(1, 5)),
+                )
+                count += 1
+            for card in persona.cards:
+                enc = encrypt_v10(raw_key, card.number.encode())
+                conn.execute(
+                    "INSERT OR IGNORE INTO credit_cards "
+                    "(guid, name_on_card, expiration_month, expiration_year, card_number_encrypted, "
+                    "date_modified, use_count, use_date, nickname) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), card.cardholder_name, card.expiry_month, card.expiry_year,
+                     enc, now, random.randint(1, 4), now, f"{card.card_type} demo"),
+                )
+                count += 1
             conn.commit()
             return count
         finally:

@@ -1,6 +1,7 @@
 {
     "_comment": "BrowserVault Demo Data Populator - Configuration",
 
+    "_personas_note": "profiles (unique personas) per browser; never shared between browsers",
     "personas": 2,
     "seed": null,
 
