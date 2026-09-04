@@ -6,8 +6,12 @@ install opens the profile and decrypts passwords/cookies/cards normally.
 from __future__ import annotations
 
 import json
+import os
 import random
+import shutil
 import sqlite3
+import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -16,6 +20,29 @@ from core.crypto_win import encrypt_v10, get_or_create_os_crypt_key
 from core.helpers import ensure_dir, get_logger, now_chrome_ts, random_past_chrome_ts
 
 logger = get_logger("chromium")
+
+# Standard install locations, checked when the exe is not on PATH.
+_EXE_CANDIDATES = {
+    "chrome": [
+        r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+        r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+        r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+    ],
+    "edge": [
+        r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+        r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+    ],
+    "brave": [
+        r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe",
+    ],
+}
+_EXE_NAME = {"chrome": "chrome.exe", "edge": "msedge.exe", "brave": "brave.exe"}
+
+# Files the browser creates/locks while priming; removed afterwards so our
+# INSERTs open cleanly.
+_PRIME_LOCK_SUFFIXES = ("-journal", "-wal", "-shm")
 
 _DEMO_SITES = [
     ("https://news.ycombinator.com/", "Hacker News"),
@@ -62,6 +89,11 @@ class ChromiumPopulator:
         self._write_preferences(profile_dir)
         self._register_in_profile_picker()
 
+        # Let the real browser create History / Web Data / Login Data / Cookies
+        # at its own current schema version, so no migration runs on first open
+        # and our INSERTs land in tables Chromium actually recognises.
+        self._prime_profile(profile_dir)
+
         raw_key = None
         if self.categories & {DataCategory.PASSWORDS, DataCategory.COOKIES, DataCategory.AUTOFILL}:
             raw_key = get_or_create_os_crypt_key(self.user_data_dir)
@@ -94,6 +126,75 @@ class ChromiumPopulator:
         if cat == DataCategory.AUTOFILL:
             return sum(7 + len(p.cards) for p in self.personas)
         return 0
+
+    def _find_exe(self) -> Path | None:
+        """Locate the browser executable: PATH first, then standard install dirs."""
+        on_path = shutil.which(_EXE_NAME.get(self.key, ""))
+        if on_path:
+            return Path(on_path)
+        for raw in _EXE_CANDIDATES.get(self.key, []):
+            p = Path(os.path.expandvars(raw))
+            if p.exists():
+                return p
+        return None
+
+    def _prime_profile(self, profile_dir: Path, timeout: int = 30) -> None:
+        """Run the browser once, headless, so it builds the profile's SQLite
+        stores at the correct schema version, then exits. Best-effort: if the
+        exe can't be found or doesn't exit cleanly, fall back to the
+        CREATE TABLE path in each _populate_* (works, but risks a migration on
+        a newer browser build)."""
+        exe = self._find_exe()
+        if exe is None:
+            logger.warning(
+                f"{self.name}: executable not found, skipping profile priming "
+                f"(schema falls back to built-in DDL)."
+            )
+            return
+
+        cmd = [
+            str(exe),
+            f'--user-data-dir={self.user_data_dir}',
+            f'--profile-directory={self.demo_profile}',
+            "--headless=new",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-startup-window",
+            "--disable-gpu",
+            "--disable-sync",
+            "--disable-extensions",
+        ]
+        logger.info(f"{self.name}: priming profile via {exe.name} (headless)…")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            logger.warning(f"{self.name}: could not launch for priming — {exc}")
+            return
+
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+        # Give the OS a moment to release file handles, then drop lock/journal
+        # files so our sqlite3 connections open without contention.
+        time.sleep(1.5)
+        for db in ("History", "Web Data", "Login Data", "Cookies"):
+            for base in (profile_dir / db, profile_dir / "Network" / db):
+                for suf in _PRIME_LOCK_SUFFIXES:
+                    lock = base.with_name(base.name + suf)
+                    try:
+                        lock.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        logger.debug(f"could not remove {lock}: {exc}")
 
     def _register_in_profile_picker(self) -> None:
         """Add the demo profile to Local State's info_cache so it shows up
