@@ -145,16 +145,18 @@ class ChromiumPopulator:
                 return p
         return None
 
-    def _prime_profile(self, profile_dir: Path, timeout: int = 25) -> None:
-        """Run the browser once against the new profile so it builds History /
-        Web Data / Login Data / Cookies at its own current schema version, then
-        exits. Best-effort: if the exe is missing or does not exit cleanly, the
-        CREATE TABLE path in each _populate_* still runs (works, but risks a
-        migration on a newer browser build).
+    def _prime_profile(self, profile_dir: Path, settle: int = 6) -> None:
+        """Run the browser briefly against the new profile so it creates
+        History / Web Data / Login Data / Cookies at its own current schema
+        version. The DB files and their schema are written within the first
+        couple of seconds of startup, so we let it run for `settle` seconds,
+        then close it gracefully. Best-effort: if the exe is missing the
+        CREATE TABLE path in each _populate_* still runs.
 
-        Uses old --headless with --dump-dom, which reliably renders one page and
-        exits on every Chromium/Brave build (the newer --headless=new can still
-        pop a visible window on some builds and wait to be closed)."""
+        We deliberately do NOT hard-kill: a taskkill /F on a starting Chromium
+        triggers its 'quit unexpectedly / restore pages' state on next launch.
+        --headless is passed (harmless where honoured); where a build ignores
+        it and shows a window, the graceful close below still lands."""
         exe = self._find_exe()
         if exe is None:
             logger.warning(
@@ -173,10 +175,9 @@ class ChromiumPopulator:
             "--no-default-browser-check",
             "--disable-sync",
             "--disable-extensions",
-            "--dump-dom",
             "about:blank",
         ]
-        logger.info(f"{self.name}: priming profile via {exe.name} (headless)…")
+        logger.info(f"{self.name}: priming profile via {exe.name}…")
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -189,11 +190,18 @@ class ChromiumPopulator:
             return
 
         try:
-            proc.wait(timeout=timeout)
+            proc.wait(timeout=settle)
         except subprocess.TimeoutExpired:
-            logger.warning(f"{self.name}: priming did not exit in {timeout}s, killing.")
-            self._kill_process_tree(proc.pid)
-            proc.wait()
+            # Still running: ask it to close gracefully (SIGTERM / WM_CLOSE),
+            # give it a few seconds, then a last-resort terminate of just this
+            # PID tree — never a taskkill /IM that would hit the user's browser.
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"{self.name}: priming process would not close, terminating PID tree.")
+                self._kill_process_tree(proc.pid)
+                proc.wait()
 
         # Give the OS a moment to release file handles, then drop lock/journal
         # files so our sqlite3 connections open without contention.
@@ -394,13 +402,15 @@ class ChromiumPopulator:
                     host = url.split("//", 1)[1].split("/", 1)[0]
                     enc = encrypt_v10(raw_key, f"demo_session_{uuid.uuid4().hex[:16]}".encode())
                     now = now_chrome_ts()
-                    # top_frame_site_key is NOT NULL with no default in the real
-                    # (browser-primed) schema, so it must be given explicitly.
+                    # The browser-primed schema drops the DEFAULT clauses the
+                    # built-in DDL carries, so every NOT NULL column must be
+                    # supplied explicitly.
                     conn.execute(
                         "INSERT OR REPLACE INTO cookies "
-                        "(creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, path, "
-                        "expires_utc, is_secure, is_httponly, last_access_utc, last_update_utc) "
-                        "VALUES (?, ?, '', 'session_id', '', ?, '/', ?, 1, 1, ?, ?)",
+                        "(creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, "
+                        "path, expires_utc, is_secure, is_httponly, last_access_utc, has_expires, "
+                        "is_persistent, priority, samesite, source_scheme, source_port, last_update_utc) "
+                        "VALUES (?, ?, '', 'session_id', '', ?, '/', ?, 1, 1, ?, 1, 1, 1, -1, 2, 443, ?)",
                         (now, host, enc, now + 30 * 86_400 * 1_000_000, now, now),
                     )
                     if db_path.name == "Cookies" and db_path.parent == profile_dir:
