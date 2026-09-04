@@ -192,16 +192,26 @@ class ChromiumPopulator:
         try:
             proc.wait(timeout=settle)
         except subprocess.TimeoutExpired:
-            # Still running: ask it to close gracefully (SIGTERM / WM_CLOSE),
-            # give it a few seconds, then a last-resort terminate of just this
-            # PID tree — never a taskkill /IM that would hit the user's browser.
-            proc.terminate()
+            pass
+
+        # Chromium on Windows does not respond to proc.terminate() (the child
+        # process tree outlives it) and would leave an about:blank window open,
+        # possibly still holding the profile DBs when we start writing. After
+        # the settle period the browser is fully started, so a PID-scoped
+        # taskkill is clean — no 'quit unexpectedly' prompt (that only happens
+        # when killing a browser mid-startup). Never taskkill /IM: that would
+        # also close the user's own running browser.
+        if proc.poll() is None:
+            logger.info(f"{self.name}: closing priming instance…")
+            self._kill_process_tree(proc.pid, force=False)
             try:
-                proc.wait(timeout=8)
+                proc.wait(timeout=6)
             except subprocess.TimeoutExpired:
-                logger.warning(f"{self.name}: priming process would not close, terminating PID tree.")
-                self._kill_process_tree(proc.pid)
-                proc.wait()
+                self._kill_process_tree(proc.pid, force=True)
+                try:
+                    proc.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"{self.name}: priming instance did not exit; continuing anyway.")
 
         # Give the OS a moment to release file handles, then drop lock/journal
         # files so our sqlite3 connections open without contention.
@@ -217,14 +227,18 @@ class ChromiumPopulator:
                     except OSError as exc:
                         logger.debug(f"could not remove {lock}: {exc}")
 
-    def _kill_process_tree(self, pid: int) -> None:
-        """Kill only the priming process and its children by PID, so a user's
-        own running browser (different PID tree) is never touched."""
+    def _kill_process_tree(self, pid: int, force: bool = True) -> None:
+        """Close the priming process and its children by PID, so a user's own
+        running browser (different PID tree) is never touched. force=False
+        requests a graceful close (WM_CLOSE); force=True adds /F."""
         if os.name != "nt":
             return
+        args = ["taskkill", "/T", "/PID", str(pid)]
+        if force:
+            args.insert(1, "/F")
         try:
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
