@@ -98,17 +98,24 @@ class ChromiumPopulator:
         if self.categories & {DataCategory.PASSWORDS, DataCategory.COOKIES, DataCategory.AUTOFILL}:
             raw_key = get_or_create_os_crypt_key(self.user_data_dir)
 
+        jobs = [
+            (DataCategory.HISTORY,   lambda: self._populate_history(profile_dir)),
+            (DataCategory.BOOKMARKS, lambda: self._populate_bookmarks(profile_dir)),
+            (DataCategory.COOKIES,   lambda: self._populate_cookies(profile_dir, raw_key)),
+            (DataCategory.PASSWORDS, lambda: self._populate_passwords(profile_dir, raw_key)),
+            (DataCategory.AUTOFILL,  lambda: self._populate_autofill(profile_dir, raw_key)),
+        ]
         counts: dict[str, int] = {}
-        if DataCategory.HISTORY in self.categories:
-            counts[DataCategory.HISTORY] = self._populate_history(profile_dir)
-        if DataCategory.BOOKMARKS in self.categories:
-            counts[DataCategory.BOOKMARKS] = self._populate_bookmarks(profile_dir)
-        if DataCategory.COOKIES in self.categories:
-            counts[DataCategory.COOKIES] = self._populate_cookies(profile_dir, raw_key)
-        if DataCategory.PASSWORDS in self.categories:
-            counts[DataCategory.PASSWORDS] = self._populate_passwords(profile_dir, raw_key)
-        if DataCategory.AUTOFILL in self.categories:
-            counts[DataCategory.AUTOFILL] = self._populate_autofill(profile_dir, raw_key)
+        for cat, fn in jobs:
+            if cat not in self.categories:
+                continue
+            try:
+                counts[cat] = fn()
+            except sqlite3.Error as exc:
+                # A primed profile can carry a newer store schema than this tool
+                # writes for. Skip that category rather than abort the whole run.
+                logger.warning(f"{self.name}: skipping {cat} — {exc}")
+                counts[cat] = 0
 
         logger.info(f"{self.name}: populated profile at {profile_dir}")
         return {label: counts}
@@ -387,11 +394,13 @@ class ChromiumPopulator:
                     host = url.split("//", 1)[1].split("/", 1)[0]
                     enc = encrypt_v10(raw_key, f"demo_session_{uuid.uuid4().hex[:16]}".encode())
                     now = now_chrome_ts()
+                    # top_frame_site_key is NOT NULL with no default in the real
+                    # (browser-primed) schema, so it must be given explicitly.
                     conn.execute(
                         "INSERT OR REPLACE INTO cookies "
-                        "(creation_utc, host_key, name, value, encrypted_value, path, expires_utc, "
-                        "is_secure, is_httponly, last_access_utc, last_update_utc) "
-                        "VALUES (?, ?, 'session_id', '', ?, '/', ?, 1, 1, ?, ?)",
+                        "(creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, path, "
+                        "expires_utc, is_secure, is_httponly, last_access_utc, last_update_utc) "
+                        "VALUES (?, ?, '', 'session_id', '', ?, '/', ?, 1, 1, ?, ?)",
                         (now, host, enc, now + 30 * 86_400 * 1_000_000, now, now),
                     )
                     if db_path.name == "Cookies" and db_path.parent == profile_dir:
