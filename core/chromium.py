@@ -87,12 +87,16 @@ class ChromiumPopulator:
         ensure_dir(profile_dir)
         ensure_dir(profile_dir / "Network")
         self._write_preferences(profile_dir)
-        self._register_in_profile_picker()
 
         # Let the real browser create History / Web Data / Login Data / Cookies
         # at its own current schema version, so no migration runs on first open
         # and our INSERTs land in tables Chromium actually recognises.
         self._prime_profile(profile_dir)
+
+        # Register in the profile picker AFTER priming: the priming browser
+        # rewrites Local State from its own state on exit and would drop an
+        # info_cache entry added beforehand.
+        self._register_in_profile_picker()
 
         raw_key = None
         if self.categories & {DataCategory.PASSWORDS, DataCategory.COOKIES, DataCategory.AUTOFILL}:
