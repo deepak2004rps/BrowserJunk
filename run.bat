@@ -64,16 +64,17 @@ if not defined PYEXE (
         del /q "!PY_TMP!" >nul 2>&1
     )
 
-    :: Re-detect after install. winget/py.exe land on PATH only in new shells,
-    :: so check the py launcher and the standard per-user install path too.
-    where py >nul 2>&1
-    if not errorlevel 1 (
-        for /f "delims=" %%p in ('py -3 -c "import sys;print(sys.executable)" 2^>nul') do set "PYEXE=%%p"
+    :: Re-detect after install. A fresh install does not update PATH in this
+    :: already-running shell, so probe known install locations by hand rather
+    :: than relying on PATH, the py launcher, or `dir` globbing.
+    call :find_python_in "%LOCALAPPDATA%\Programs\Python"
+    if not defined PYEXE call :find_python_in "%ProgramFiles%\Python312"
+    if not defined PYEXE call :find_python_in "%ProgramFiles%\Python313"
+    if not defined PYEXE if exist "%LOCALAPPDATA%\Microsoft\WindowsApps\..\..\..\..\Programs\Python" (
+        call :find_python_in "%LOCALAPPDATA%\Programs\Python"
     )
-    if not defined PYEXE (
-        for /f "delims=" %%p in ('dir /b /s "%LOCALAPPDATA%\Programs\Python\Python3*\python.exe" 2^>nul') do (
-            if not defined PYEXE set "PYEXE=%%p"
-        )
+    if not defined PYEXE if exist "%WINDIR%\py.exe" (
+        for /f "delims=" %%p in ('"%WINDIR%\py.exe" -3 -c "import sys;print(sys.executable)" 2^>nul') do set "PYEXE=%%p"
     )
 
     if not defined PYEXE (
@@ -128,3 +129,16 @@ echo   Complete. Check output\ for reports.
 echo  ========================================
 echo.
 pause
+exit /b 0
+
+
+:: ── Subroutine: set PYEXE to the newest python.exe >= 3.10 under a root ───
+:find_python_in
+if not exist "%~1" exit /b 0
+for /f "delims=" %%e in ('dir /b /s /o-n "%~1\python.exe" 2^>nul') do (
+    if not defined PYEXE (
+        "%%e" -c "import sys; sys.exit(0 if sys.version_info[:2] >= (3,10) else 1)" >nul 2>&1
+        if not errorlevel 1 set "PYEXE=%%e"
+    )
+)
+exit /b 0
