@@ -125,6 +125,10 @@ class ChromiumPopulator:
         path.write_text(json.dumps(state), encoding="utf-8")
 
     def _write_preferences(self, profile_dir: Path) -> None:
+        """Write a minimally-valid Preferences file. A bare {"profile":{"name":...}}
+        stub is rejected on load ("Something went wrong when opening your profile"):
+        Chromium expects the profile block to carry creation metadata and a clean
+        exit_type, otherwise it treats the profile as corrupt."""
         path = profile_dir / "Preferences"
         prefs = {}
         if path.exists():
@@ -132,8 +136,26 @@ class ChromiumPopulator:
                 prefs = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 prefs = {}
+
         display_name = self.personas[0].full_name if self.personas else self.demo_profile
-        prefs.setdefault("profile", {})["name"] = display_name
+        now_us = now_chrome_ts()
+
+        profile = prefs.setdefault("profile", {})
+        profile["name"] = display_name
+        profile.setdefault("created_by_version", "120.0.0.0")
+        profile.setdefault("creation_time", str(now_us))
+        profile.setdefault("exit_type", "Normal")
+        profile.setdefault("managed_user_id", "")
+        profile.setdefault("avatar_index", 0)
+        profile.setdefault("is_using_default_name", False)
+        profile.setdefault("is_using_default_avatar", True)
+        profile.setdefault("last_engagement_time", str(now_us))
+
+        prefs.setdefault("account_id_migration_state", 2)
+        prefs.setdefault("browser", {}).setdefault("has_seen_welcome_page", True)
+        prefs.setdefault("credentials_enable_service", True)
+        prefs.setdefault("session", {}).setdefault("restore_on_startup", 5)
+
         path.write_text(json.dumps(prefs), encoding="utf-8")
 
     def _populate_history(self, profile_dir: Path) -> int:
