@@ -91,6 +91,17 @@ class ChromiumPopulator:
         browser). Each profile holds only its own persona's data."""
         all_results: dict[str, dict[str, int]] = {}
 
+        # Mint/reuse the OS-crypt key once, up front, before any persona's
+        # Chrome priming launch. If this is deferred into the per-persona
+        # loop, a later persona's priming instance can race the key write
+        # in Local State and cause Chrome to mint its own key, silently
+        # invalidating ciphertexts (passwords/cookies/cards) written for
+        # earlier personas under the old key -> "Profile error occurred"
+        # on open, and empty passwords/payment methods.
+        raw_key = None
+        if not self.dry_run and (self.categories & {DataCategory.PASSWORDS, DataCategory.COOKIES, DataCategory.AUTOFILL}):
+            raw_key = get_or_create_os_crypt_key(self.user_data_dir)
+
         for persona in self.personas:
             profile_name = self.profile_name_for(persona)
             profile_dir = self.user_data_dir / profile_name
@@ -111,10 +122,6 @@ class ChromiumPopulator:
             # first open and our INSERTs land in tables Chromium recognises.
             self._prime_profile(profile_dir, profile_name)
             self._register_in_profile_picker(profile_name, persona)
-
-            raw_key = None
-            if self.categories & {DataCategory.PASSWORDS, DataCategory.COOKIES, DataCategory.AUTOFILL}:
-                raw_key = get_or_create_os_crypt_key(self.user_data_dir)
 
             jobs = [
                 (DataCategory.HISTORY,   lambda p=profile_dir, pe=persona: self._populate_history(p, pe)),
