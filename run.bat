@@ -9,6 +9,21 @@ echo   BrowserVault Demo Data Populator
 echo  ========================================
 echo.
 
+:: ── Parse our own flags (stripped before args pass to main.py) ───────────
+:: --skip-deps  : don't touch pip at all, just run (fast path once set up).
+set "SKIP_DEPS="
+set "APP_ARGS="
+:parse_args
+if "%~1"=="" goto after_args
+if /i "%~1"=="--skip-deps" (
+    set "SKIP_DEPS=1"
+) else (
+    set "APP_ARGS=!APP_ARGS! %1"
+)
+shift
+goto parse_args
+:after_args
+
 :: ── Locate a real Python 3.10+ ───────────────────────────────────────────
 :: Note: Windows ships a stub python.exe in WindowsApps that only opens the
 :: Microsoft Store, so `where python` succeeding is not proof Python exists.
@@ -104,13 +119,23 @@ if not exist ".venv\Scripts\activate.bat" (
 call .venv\Scripts\activate.bat
 
 :: ── Install / upgrade dependencies ───────────────────────────────────────
-echo [..] Checking dependencies...
-pip install -q -r requirements.txt >nul 2>&1
-if errorlevel 1 (
-    echo [WARN] pip install had issues, retrying with --upgrade...
-    pip install --upgrade -r requirements.txt
+if defined SKIP_DEPS (
+    echo [OK] Skipping dependency check ^(--skip-deps^).
+) else (
+    echo [..] Checking dependencies...
+    :: Fast path: if everything already imports, skip pip entirely (pip's
+    :: resolve/verify pass is the slow part even when nothing needs installing).
+    python -c "import click, rich, faker, Crypto, win32crypt" >nul 2>&1
+    if errorlevel 1 (
+        echo [..] Installing missing dependencies ^(first run only^)...
+        pip install -q -r requirements.txt >nul 2>&1
+        if errorlevel 1 (
+            echo [WARN] pip install had issues, retrying with --upgrade...
+            pip install --upgrade -r requirements.txt
+        )
+    )
+    echo [OK] Dependencies ready.
 )
-echo [OK] Dependencies ready.
 
 :: ── Create output directories ────────────────────────────────────────────
 if not exist "logs" mkdir logs
@@ -120,7 +145,7 @@ if not exist "output" mkdir output
 echo.
 echo  ─── Starting population ───
 echo.
-python main.py %*
+python main.py !APP_ARGS!
 
 :: ── Done ─────────────────────────────────────────────────────────────────
 echo.
