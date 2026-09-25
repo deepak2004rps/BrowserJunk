@@ -33,11 +33,30 @@ from core.browsers import (
     DataCategory,
     build_populators,
     detect_installed_browsers,
+    find_demo_profiles,
+    purge_demo_profiles,
 )
 from core.persona import generate_personas
 from core.helpers import OUTPUT_DIR, get_logger, save_reports
 
 _CHROMIUM_EXE = {"chrome": "chrome.exe", "edge": "msedge.exe", "brave": "brave.exe"}
+_IMAGE_NAMES = {"chrome": "chrome.exe", "edge": "msedge.exe", "brave": "brave.exe", "firefox": "firefox.exe"}
+
+
+def _close_target_browsers(browser_keys: list[str]) -> None:
+    """Force-close the targeted browsers by image name so their demo profile
+    folders aren't locked when we delete them. Intended for a dedicated test VM
+    (also closes the user's own windows of those browsers)."""
+    import os
+    import subprocess
+    if os.name != "nt":
+        return
+    for image in {_IMAGE_NAMES[k] for k in browser_keys if k in _IMAGE_NAMES}:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", image],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+    time.sleep(2.0)
 
 
 def _write_launchers(pop) -> list[Path]:
@@ -185,6 +204,7 @@ def main(
         return
 
     # ── Every run gets its own profile, never overwrites a previous one ────
+    base_profile_name = profile_name
     profile_name = f"{profile_name}_{time.strftime('%Y%m%d_%H%M%S')}"
 
     # ── Resolve inputs (CLI flags win, else fall back to config.json) ──────
@@ -227,6 +247,30 @@ def main(
             "or --list-browsers to check detection.[/yellow]"
         )
         sys.exit(0)
+
+    # ── Clean up existing demo profiles before creating new ones ──────────
+    if not dry_run:
+        target_keys = [pop.key for pop in pop_list]
+        existing = find_demo_profiles(target_keys, base_profile_name)
+        if existing:
+            total = sum(len(v) for v in existing.values())
+            console.print(
+                f"\n[yellow]Found {total} existing demo profile(s) from previous "
+                f"runs:[/yellow]"
+            )
+            for key, paths in existing.items():
+                console.print(f"  [bold]{BROWSER_REGISTRY[key]['name']}[/bold]: {len(paths)}")
+            console.print(
+                "[dim]Leaving them will let old profiles accumulate. Deleting them "
+                "requires the browser to be closed.[/dim]"
+            )
+            if click.confirm("Delete these existing demo profiles before continuing?", default=True):
+                _close_target_browsers(target_keys)
+                removed = purge_demo_profiles(target_keys, base_profile_name)
+                console.print(f"[green]✓[/green] Removed {removed} demo profile(s).")
+            else:
+                console.print("[yellow]Aborted — no changes made.[/yellow]")
+                sys.exit(0)
 
     # ── Generate a disjoint set of personas per browser ──────────────────
     total_personas = personas * len(pop_list)
