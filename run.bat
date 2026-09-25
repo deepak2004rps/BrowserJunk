@@ -79,9 +79,9 @@ if not defined PYEXE (
         del /q "!PY_TMP!" >nul 2>&1
     )
 
-    :: Re-detect after install. A fresh install does not update PATH in this
-    :: already-running shell, so probe known install locations by hand rather
-    :: than relying on PATH, the py launcher, or `dir` globbing.
+    rem Re-detect after install. A fresh install does not update PATH in this
+    rem already-running shell, so probe known install locations by hand rather
+    rem than relying on PATH, the py launcher, or dir globbing.
     call :find_python_in "%LOCALAPPDATA%\Programs\Python"
     if not defined PYEXE call :find_python_in "%ProgramFiles%\Python312"
     if not defined PYEXE call :find_python_in "%ProgramFiles%\Python313"
@@ -119,23 +119,27 @@ if not exist ".venv\Scripts\activate.bat" (
 call .venv\Scripts\activate.bat
 
 :: ── Install / upgrade dependencies ───────────────────────────────────────
+rem Fast path: if all deps already import, skip pip entirely (pip's
+rem resolve/verify pass is slow even when nothing needs installing).
+rem --skip-deps bypasses the check outright.
 if defined SKIP_DEPS (
     echo [OK] Skipping dependency check ^(--skip-deps^).
-) else (
-    echo [..] Checking dependencies...
-    :: Fast path: if everything already imports, skip pip entirely (pip's
-    :: resolve/verify pass is the slow part even when nothing needs installing).
-    python -c "import click, rich, faker, Crypto, win32crypt" >nul 2>&1
-    if errorlevel 1 (
-        echo [..] Installing missing dependencies ^(first run only^)...
-        pip install -q -r requirements.txt >nul 2>&1
-        if errorlevel 1 (
-            echo [WARN] pip install had issues, retrying with --upgrade...
-            pip install --upgrade -r requirements.txt
-        )
-    )
-    echo [OK] Dependencies ready.
+    goto deps_done
 )
+echo [..] Checking dependencies...
+python -c "import click, rich, faker, Crypto, win32crypt" >nul 2>&1
+if not errorlevel 1 (
+    echo [OK] Dependencies already present.
+    goto deps_done
+)
+echo [..] Installing missing dependencies ^(first run only^)...
+pip install -q -r requirements.txt >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] pip install had issues, retrying with --upgrade...
+    pip install --upgrade -r requirements.txt
+)
+echo [OK] Dependencies ready.
+:deps_done
 
 :: ── Create output directories ────────────────────────────────────────────
 if not exist "logs" mkdir logs
