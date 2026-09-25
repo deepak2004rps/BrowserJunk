@@ -176,17 +176,22 @@ class ChromiumPopulator:
         version. Best-effort: if the exe is missing the CREATE TABLE path in
         each _populate_* still runs.
 
-        Key points learned the hard way with Brave:
-        - --no-startup-window is honoured even when --headless is not, so no
-          window opens, but Brave then lingers in the background holding the
-          profile DBs (causing 'database is locked' on our writes), and a
-          graceful close will not shift it.
-        - So we DO force-kill the priming PID tree, then repair the fallout:
-          the only real downside of /F was the 'Brave quit unexpectedly /
-          restore pages' prompt on next open, which comes from
-          Preferences -> profile.exit_type. We rewrite that to "Normal"
-          after the kill, so the real open is clean.
-        - Never taskkill /IM: that would also close the user's own browser."""
+        Priming leaves the real browser process running in the background:
+        Chromium's launcher process exits immediately after spawning the
+        actual browser (a different PID), so waiting on / polling the PID we
+        spawned tells us nothing about the browser that now holds the profile
+        DBs open. If we don't close it, our writes hit a locked DB (Edge:
+        'database is locked') or land in a store the still-live browser
+        overwrites on its own exit (Chrome: writes vanish -> empty
+        passwords/payments), and its dirty shutdown flags the profile corrupt
+        ('Profile error occurred') on next open.
+
+        So we kill the browser by image name after priming, then wait for the
+        Login Data lock to release before returning. NOTE: killing by image
+        name also closes any of the user's own windows of that browser — this
+        is intended for a dedicated test VM where no real browsing is running.
+        We then rewrite Preferences -> profile.exit_type = Normal so the real
+        open does not show a 'restore pages' crash prompt."""
         exe = self._find_exe()
         if exe is None:
             logger.warning(
@@ -218,29 +223,26 @@ class ChromiumPopulator:
             logger.warning(f"{self.name}: could not launch for priming — {exc}")
             return
 
+        # Give the browser time to create the stores at its current schema.
         try:
             proc.wait(timeout=settle)
         except subprocess.TimeoutExpired:
             pass
-
-        # Force-close the priming PID tree: --no-startup-window leaves Brave
-        # running in the background with the DBs locked, and a graceful close
-        # will not move it. Try graceful once (cheap), then /F.
-        if proc.poll() is None:
-            logger.info(f"{self.name}: closing priming instance…")
-            self._kill_process_tree(proc.pid, force=False)
-            try:
-                proc.wait(timeout=4)
-            except subprocess.TimeoutExpired:
-                self._kill_process_tree(proc.pid, force=True)
-                try:
-                    proc.wait(timeout=6)
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"{self.name}: priming instance did not exit; continuing.")
-
-        # Wait for handles to release, then clear journal/lock files and repair
-        # the exit_type marker so the real open does not show a crash prompt.
         time.sleep(2.0)
+
+        # Close the priming browser. The PID we spawned is just the launcher
+        # and has usually already exited, so kill by image name to reach the
+        # real background process holding the DBs. (Closes the user's own
+        # windows of this browser too — intended on a dedicated test VM.)
+        logger.info(f"{self.name}: closing priming instance…")
+        self._kill_by_image_name()
+
+        # Wait for the profile's Login Data lock to actually release before we
+        # write, instead of guessing with a fixed sleep.
+        self._wait_for_db_unlock(profile_dir / "Login Data", timeout=15.0)
+
+        # Clear leftover journal/lock files and repair the exit_type marker so
+        # the real open does not show a crash prompt.
         for db in ("History", "Web Data", "Login Data", "Cookies"):
             for base in (profile_dir / db, profile_dir / "Network" / db):
                 for suf in _PRIME_LOCK_SUFFIXES:
@@ -252,6 +254,52 @@ class ChromiumPopulator:
                     except OSError as exc:
                         logger.debug(f"could not remove {lock}: {exc}")
         self._mark_clean_exit(profile_dir)
+
+    def _kill_by_image_name(self) -> None:
+        """Kill every process of this browser's exe by image name, then wait
+        for them to disappear. This reaches the real background browser the
+        launcher spawned (a different PID we never tracked). It also closes
+        the user's own windows of this browser, so it is only appropriate on a
+        dedicated test VM."""
+        if os.name != "nt":
+            return
+        image = _EXE_NAME.get(self.key)
+        if not image:
+            return
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", image],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        # Wait until no process with that image name remains.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            res = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {image}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+            )
+            if image.lower() not in (res.stdout or "").lower():
+                return
+            time.sleep(0.5)
+        logger.warning(f"{self.name}: {image} still present after kill; continuing.")
+
+    def _wait_for_db_unlock(self, db_path: Path, timeout: float = 15.0) -> None:
+        """Poll until we can open db_path for writing (BEGIN IMMEDIATE), i.e.
+        the browser has released its lock. Returns when writable or on timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=1.0)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.rollback()
+                    return
+                finally:
+                    conn.close()
+            except sqlite3.OperationalError:
+                time.sleep(0.5)
+            except sqlite3.Error:
+                return
+        logger.warning(f"{self.name}: {db_path.name} still locked after {timeout}s; continuing.")
 
     def _mark_clean_exit(self, profile_dir: Path) -> None:
         """Set profile.exit_type = Normal in Preferences so the browser does not
@@ -270,25 +318,6 @@ class ChromiumPopulator:
             path.write_text(json.dumps(prefs), encoding="utf-8")
         except OSError as exc:
             logger.debug(f"could not rewrite Preferences: {exc}")
-
-    def _kill_process_tree(self, pid: int, force: bool = True) -> None:
-        """Close the priming process and its children by PID, so a user's own
-        running browser (different PID tree) is never touched. force=False
-        requests a graceful close (WM_CLOSE); force=True adds /F."""
-        if os.name != "nt":
-            return
-        args = ["taskkill", "/T", "/PID", str(pid)]
-        if force:
-            args.insert(1, "/F")
-        try:
-            subprocess.run(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError:
-            pass
 
     def _register_in_profile_picker(self, profile_name: str, persona) -> None:
         """Add a demo profile to Local State's info_cache so it shows up in the
