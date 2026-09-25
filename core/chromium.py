@@ -211,6 +211,18 @@ class ChromiumPopulator:
             "--disable-extensions",
             "--disable-background-mode",
         ]
+        # Chrome runs one process per user-data-dir (a "singleton"). If any
+        # instance for this user-data-dir is still alive — e.g. left over from
+        # priming the PREVIOUS profile — a new launch just forwards its request
+        # to that instance and exits immediately, so OUR profile never gets
+        # primed (its Login Data/Web Data are never created) and we then write
+        # into a half-built profile -> corrupt on open, empty passwords/cards.
+        # So before priming: kill any running instance and clear the singleton
+        # lock files, guaranteeing this launch starts a fresh browser that
+        # actually initialises our profile.
+        self._kill_by_image_name()
+        self._clear_singleton_locks()
+
         logger.info(f"{self.name}: priming profile via {exe.name}…")
         try:
             proc = subprocess.Popen(
@@ -223,12 +235,11 @@ class ChromiumPopulator:
             logger.warning(f"{self.name}: could not launch for priming — {exc}")
             return
 
-        # Give the browser time to create the stores at its current schema.
-        try:
-            proc.wait(timeout=settle)
-        except subprocess.TimeoutExpired:
-            pass
-        time.sleep(2.0)
+        # Wait until priming has actually created this profile's core stores,
+        # rather than trusting a fixed timeout (the launcher PID can exit early
+        # while the browser keeps initialising in the background).
+        self._wait_for_prime(profile_dir, timeout=settle)
+        time.sleep(1.0)
 
         # Close the priming browser. The PID we spawned is just the launcher
         # and has usually already exited, so kill by image name to reach the
@@ -236,6 +247,7 @@ class ChromiumPopulator:
         # windows of this browser too — intended on a dedicated test VM.)
         logger.info(f"{self.name}: closing priming instance…")
         self._kill_by_image_name()
+        self._clear_singleton_locks()
 
         # Wait for the profile's Login Data lock to actually release before we
         # write, instead of guessing with a fixed sleep.
@@ -281,6 +293,38 @@ class ChromiumPopulator:
                 return
             time.sleep(0.5)
         logger.warning(f"{self.name}: {image} still present after kill; continuing.")
+
+    def _clear_singleton_locks(self) -> None:
+        """Remove Chrome's per-user-data-dir singleton markers so the next
+        launch starts a fresh browser instead of forwarding to a stale one.
+        On Windows these are files in the User Data root."""
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"):
+            p = self.user_data_dir / name
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug(f"could not remove {p}: {exc}")
+
+    def _wait_for_prime(self, profile_dir: Path, timeout: float = 12.0) -> None:
+        """Wait until priming has created this profile's core stores (proof the
+        browser actually initialised our profile), up to timeout seconds."""
+        needed = [profile_dir / "Login Data", profile_dir / "Web Data",
+                  profile_dir / "History"]
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all(p.exists() for p in needed):
+                # Give the browser a beat to finish writing schema before kill.
+                time.sleep(1.5)
+                return
+            time.sleep(0.5)
+        missing = [p.name for p in needed if not p.exists()]
+        if missing:
+            logger.warning(
+                f"{self.name}: priming did not create {', '.join(missing)} "
+                f"within {timeout}s; continuing (schema falls back to built-in DDL)."
+            )
 
     def _wait_for_db_unlock(self, db_path: Path, timeout: float = 15.0) -> None:
         """Poll until we can open db_path for writing (BEGIN IMMEDIATE), i.e.
